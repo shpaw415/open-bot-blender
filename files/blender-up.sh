@@ -27,20 +27,31 @@ running() {
   pgrep -f blender-serve.py >/dev/null 2>&1
 }
 
+# blender runs in the background so this loop keeps evaluating the toggle
+# every cycle; startpid fences the slow xvfb/blender startup window so the
+# loop does not double-spawn before the serve process appears.
+startpid=""
 while :; do
   if enabled; then
-    if ! running && command -v blender >/dev/null 2>&1 && [ -f "$serve" ]; then
+    if running; then
+      startpid=""
+    elif [ -n "$startpid" ] && kill -0 "$startpid" 2>/dev/null; then
+      : # xvfb/blender still coming up
+    elif command -v blender >/dev/null 2>&1 && [ -f "$serve" ]; then
       echo "$(date -u +%FT%TZ) blender starting" >>"$log"
       BLENDER_MCP_PORT="${BLENDER_MCP_PORT:-9876}" \
         PYTHONPATH="$requests${PYTHONPATH:+:$PYTHONPATH}" \
         xvfb-run -a blender --factory-startup -noaudio \
-        -P "$serve" >>"$log" 2>&1 || true
-      echo "$(date -u +%FT%TZ) blender exited; restarting in 2s" >>"$log"
+        -P "$serve" >>"$log" 2>&1 &
+      startpid=$!
     fi
-  elif running; then
-    pkill -f blender-serve.py 2>/dev/null || true
-    pkill -f "xvfb-run -a blender" 2>/dev/null || true
-    echo "$(date -u +%FT%TZ) blender stopped (plugin service off)" >>"$log"
+  else
+    startpid=""
+    if running; then
+      pkill -f "blender --factory-startup" 2>/dev/null || true
+      pkill -f blender-serve.py 2>/dev/null || true
+      echo "$(date -u +%FT%TZ) blender stopped (plugin service off)" >>"$log"
+    fi
   fi
   sleep 2
 done

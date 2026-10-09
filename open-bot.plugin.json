@@ -1,7 +1,7 @@
 {
   "id": "blender",
   "name": "Blender 3D",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Headless Blender 3D modeling on this desktop: a blender-team worker pipeline (model, materials, lighting, qa) drives a live Blender through the blender MCP tools and exports .glb/.stl models with rendered previews into the workspace.",
   "author": "shpaw415",
   "repo": "shpaw415/open-bot-blender",
