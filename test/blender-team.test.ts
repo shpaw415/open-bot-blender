@@ -9,9 +9,12 @@ import {
 import { join } from "node:path"
 import {
   DEFAULT_ROLES,
+  clefCreds,
   extractResult,
   isProcessAlive,
+  judgeQuestions,
   parseRoles,
+  qaDecision,
   rolePrompt,
 } from "../files/blender-team"
 
@@ -80,6 +83,58 @@ test("rolePrompt describes the scene state for fresh, resumed, and retried runs"
   )
 })
 
+test("rolePrompt noSave variant defers saving to the orchestrator", () => {
+  const prompt = rolePrompt(
+    "materials",
+    "an owl",
+    "/tmp/d",
+    "/tmp/d/scene.blend",
+    "/tmp/o.glb",
+    [],
+    false,
+    true,
+  )
+  expect(prompt).toContain("Do NOT save")
+  expect(prompt).toContain("parallel")
+  expect(prompt).not.toContain("save_as_mainfile")
+})
+
+test("qaDecision applies the judge thresholds with an escalation band", () => {
+  expect(qaDecision(0.95)).toBe("pass")
+  expect(qaDecision(0.7)).toBe("pass")
+  expect(qaDecision(0.69)).toBe("escalate")
+  expect(qaDecision(0.5)).toBe("escalate")
+  expect(qaDecision(0.3)).toBe("escalate")
+  expect(qaDecision(0.29)).toBe("fail")
+  expect(qaDecision(0.02)).toBe("fail")
+})
+
+test("judgeQuestions is a typed battery ending in a pass verdict", () => {
+  const q = judgeQuestions() as Record<string, any>
+  expect(Object.keys(q)).toContain("matches_goal")
+  expect(q.geometry.criteria).toHaveProperty("none")
+  expect(q.severity.type).toBe("score")
+  expect(q.pass.type).toBe("noul")
+})
+
+test("clefCreds prefers env vars, then the image auth file, else null", () => {
+  const saved = { id: process.env.CLOUDFLARE_ACCOUNT_ID, tk: process.env.CLOUDFLARE_API_TOKEN }
+  process.env.CLOUDFLARE_ACCOUNT_ID = "env-id"
+  process.env.CLOUDFLARE_API_TOKEN = "env-token"
+  expect(clefCreds()).toEqual({ accountId: "env-id", token: "env-token" })
+  delete process.env.CLOUDFLARE_ACCOUNT_ID
+  delete process.env.CLOUDFLARE_API_TOKEN
+  // real desktop: the open-bot image auth file is present and used silently
+  const fromFile = clefCreds()
+  if (fromFile) {
+    expect(fromFile.accountId.length).toBeGreaterThan(0)
+    expect(fromFile.token.length).toBeGreaterThan(0)
+  }
+  expect(clefCreds("/tmp/opencode/definitely-missing-home")).toBeNull()
+  if (saved.id !== undefined) process.env.CLOUDFLARE_ACCOUNT_ID = saved.id
+  if (saved.tk !== undefined) process.env.CLOUDFLARE_API_TOKEN = saved.tk
+})
+
 test("manifest ships the payload files and agent surfaces", () => {
   expect(manifest.id).toBe("blender")
   expect(manifest.files.map((f: any) => f.name)).toEqual([
@@ -87,6 +142,7 @@ test("manifest ships the payload files and agent surfaces", () => {
     "blender-up.sh",
     "blender-serve.py",
     "addon.py",
+    "qa_checks.py",
   ])
   for (const file of manifest.files) {
     expect(readFileSync(join(root, file.source), "utf8").length).toBeGreaterThan(0)
@@ -96,6 +152,14 @@ test("manifest ships the payload files and agent surfaces", () => {
   expect(manifest.opencode.mcp.blender.enabled).toBe(true)
   expect(manifest.setup.commands.length).toBeGreaterThan(0)
   expect(manifest.setup.uninstall.length).toBeGreaterThan(0)
+})
+
+test("setup installs numpy for the glTF exporter and ships the qa toggles", () => {
+  const apt = manifest.setup.commands.find((c: string) => c.includes("apt-get install"))
+  expect(apt).toContain("python3-numpy")
+  const keys = manifest.configs.map((c: any) => c.key)
+  expect(keys).toContain("qa_judge")
+  expect(keys).toContain("parallel")
 })
 
 test("worker sessions carry the worker: title prefix", () => {

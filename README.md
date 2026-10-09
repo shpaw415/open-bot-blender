@@ -24,11 +24,28 @@ the desktop:
 
 - `open-bot.plugin.json` — the manifest (files, setup, skill, opencode mcp +
   `blender-worker` agent + build-agent `blender_*` tool deny)
-- `files/blender-team` — orchestrator CLI (bun)
+- `files/blender-team` — orchestrator CLI (bun): stage workers,
+  materials+lighting in parallel, cheap QA (bmesh + Clef judge) with
+  escalation to the LLM qa worker, fix rounds re-checked deterministically
+- `files/qa_checks.py` — headless deterministic QA on a scene copy: bmesh
+  report, two 16-sample JPEG previews, and the model export in one process
 - `files/blender-up.sh` — service supervisor (config-driven on/off)
 - `files/blender-serve.py`, `files/addon.py` — vendored blender-mcp bridge
   (upstream: https://github.com/ahujames/blender-mcp), loaded via symlinks
   the setup commands place under `/home/agent/.open-bot/plugin-blender/`
+
+## QA judge
+
+QA does not burn an LLM session by default: the orchestrator snapshots the
+live scene over the bridge socket, runs `qa_checks.py` headless (bmesh
+ground truth + previews + export, ~1 s of compute), and asks the Clef
+decision model (Cloudflare Workers AI, `@cf/cloudflare/clef`) to judge the
+previews against the goal. Pass p >= 0.7 passes; p < 0.3 fails into fix
+rounds re-checked the same way (~10 s each); the band between escalates to
+the legacy LLM qa worker. Credentials come from `CLOUDFLARE_ACCOUNT_ID` /
+`CLOUDFLARE_API_TOKEN` or the open-bot image auth file; the dashboard
+config `qa_judge` (on/off) disables the judge. Geometry ground truth stays
+in bmesh — the vision judge is for appearance only.
 
 ## On/off
 

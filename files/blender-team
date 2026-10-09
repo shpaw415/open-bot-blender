@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs"
 import { createConnection } from "node:net"
 
 const home = process.env.HOME ?? "/home/agent"
@@ -7,6 +7,8 @@ const blenderPort = Number(process.env.BLENDER_MCP_PORT ?? "9876")
 const SOCKET_TIMEOUT_MS = 5_000
 const LOCK_DIR = `${home}/.open-bot/blender-team.lock`
 const LOCK_TIMEOUT_MS = 60_000
+const JUDGE_MODEL = process.env.BLENDER_JUDGE_MODEL ?? "@cf/cloudflare/clef"
+const ROUTE_MODEL = process.env.BLENDER_ROUTE_MODEL ?? "clef-flash"
 
 type Role = "model" | "materials" | "lighting" | "qa" | "fix"
 
@@ -53,7 +55,7 @@ function fail(message: string): never {
 
 function usage(): never {
   fail(
-    'usage: blender-team "goal" [--roles model,materials,lighting,qa] [--rounds 1] [--timeout 30] [--out /home/agent/workspace/model.glb] [--resume]',
+    'usage: blender-team "goal" [--roles model,materials,lighting,qa] [--auto-roles] [--rounds 1] [--timeout 30] [--out /home/agent/workspace/model.glb] [--resume] [--serial]',
   )
 }
 
@@ -79,18 +81,32 @@ async function blenderSocketUp(): Promise<boolean> {
   })
 }
 
-// The blender plugin's service toggle lives in the plugin settings the
+// The blender plugin's service toggles live in the plugin settings the
 // control plane syncs to ~/.config/open-bot/plugin-blender.json. Missing
 // file defaults to on; anything other than "off" is on.
-export function blenderServiceEnabled(): boolean {
+type PluginSettings = { enabled?: string; qa_judge?: string; parallel?: string }
+
+function pluginSettings(): PluginSettings {
   try {
     const config = JSON.parse(
       readFileSync(`${home}/.config/open-bot/plugin-blender.json`, "utf8"),
-    ) as { settings?: { enabled?: string } }
-    return config.settings?.enabled !== "off"
+    ) as { settings?: PluginSettings }
+    return config.settings ?? {}
   } catch {
-    return true
+    return {}
   }
+}
+
+export function blenderServiceEnabled(): boolean {
+  return pluginSettings().enabled !== "off"
+}
+
+export function qaJudgeEnabled(): boolean {
+  return pluginSettings().qa_judge !== "off"
+}
+
+export function parallelStagesEnabled(): boolean {
+  return pluginSettings().parallel !== "off"
 }
 
 export function isProcessAlive(pid: number): boolean {
@@ -157,6 +173,7 @@ export function rolePrompt(
   outPath: string,
   context: string[],
   resumed = false,
+  noSave = false,
 ): string {
   let sceneState: string
   if (context.length > 0) {
@@ -174,9 +191,10 @@ export function rolePrompt(
     `A single Blender instance runs headless on 127.0.0.1:9876 with the team scene in memory. Drive it ONLY through the blender MCP tools (get_scene_info, get_object_info, execute_blender_code). Never launch another Blender process and never open the scene file in a second instance.`,
     sceneState,
   ].join("\n\n")
-  const save =
-    `When your stage is done, save the scene with execute_blender_code: bpy.ops.wm.save_as_mainfile(filepath="${blendPath}")` +
-    ` and render a preview to ${dir}/preview-${role}.png (engine CYCLES, 960x540, 32 samples, camera framed on the model; create the camera if missing).`
+  const save = noSave
+    ? `Do NOT save the scene and do NOT render a preview: a worker for another stage runs in parallel on the same live scene, and the orchestrator snapshots the scene once both stages are done. Leave the scene state clean.`
+    : `When your stage is done, save the scene with execute_blender_code: bpy.ops.wm.save_as_mainfile(filepath="${blendPath}")` +
+      ` and render a preview to ${dir}/preview-${role}.png (engine CYCLES, 960x540, 32 samples, camera framed on the model; create the camera if missing).`
   const tasks: Record<Role, string> = {
     model:
       "Build the geometry for the goal at real-world scale (1 Blender unit = 1 meter). Clean topology, clearly named objects. Do not add materials, lights, or cameras. If the goal names a printable part, keep walls printable and dimensions exact.",
@@ -189,6 +207,279 @@ export function rolePrompt(
   }
   return `${shared}\n\n${tasks[role]}\n\n${save}\n\nEnd your reply with exactly one line starting with "RESULT: " — for qa and fix it must start with "RESULT: PASS ..." or "RESULT: FAIL: <defects>".`
 }
+
+// ---------- Clef judge (decision level) ----------
+
+// Cloudflare credentials for the Clef judge: env vars first, then the
+// open-bot image auth file when present. Values are never printed.
+export function clefCreds(homeOverride?: string): {
+  accountId: string
+  token: string
+} | null {
+  const base = homeOverride ?? home
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID
+  const token = process.env.CLOUDFLARE_API_TOKEN
+  if (accountId && token) return { accountId, token }
+  try {
+    const auth = JSON.parse(
+      readFileSync(`${base}/.config/open-bot/image-auth.json`, "utf8"),
+    ) as { accountId?: string; token?: string }
+    if (auth.accountId && auth.token) return { accountId: auth.accountId, token: auth.token }
+  } catch {
+    void 0
+  }
+  return null
+}
+
+export type QaAnswers = {
+  pass?: { noul?: number }
+  severity?: { score?: number }
+  geometry?: { choice?: string }
+  materials?: { choice?: string }
+}
+
+export function judgeQuestions(): Record<string, unknown> {
+  return {
+    matches_goal: {
+      type: "noul",
+      instructions:
+        "Does the rendered model visually match the goal description (right kind of object, right shape)?",
+    },
+    geometry: {
+      type: "choice",
+      instructions: "Which geometry defect is most visible in the renders?",
+      criteria: {
+        none: "No visible geometry defect",
+        hole_crack: "A hole, crack, missing face, or shaved edge",
+        seam: "Visible seams, shading discontinuities, or faceting on surfaces that should be smooth",
+        misplaced: "Parts misaligned, floating, or intersecting",
+      },
+    },
+    materials: {
+      type: "choice",
+      instructions: "Which material or shading defect is most visible?",
+      criteria: {
+        none: "Materials look plausible for the goal",
+        wrong_color: "Wrong color or saturation for the goal",
+        speckle: "Fireflies, white speckle, or blotchy shading",
+        inconsistent: "Materials inconsistent between parts that should match",
+      },
+    },
+    severity: {
+      type: "score",
+      instructions: "Overall severity of visible defects against the goal",
+      criteria: ["No visible defect", "Minor cosmetic", "Noticeable, should fix", "Major, unusable"],
+    },
+    pass: {
+      type: "noul",
+      instructions: "Should this model pass visual QA for the stated goal as-is?",
+    },
+  }
+}
+
+// Verdict from the judge's pass probability: confident pass, confident fail,
+// or the uncertainty band that escalates to the legacy LLM qa worker.
+export function qaDecision(
+  passProbability: number,
+  _report?: unknown,
+): "pass" | "fail" | "escalate" {
+  if (passProbability >= 0.7) return "pass"
+  if (passProbability < 0.3) return "fail"
+  return "escalate"
+}
+
+function jpegDataUri(path: string): string | null {
+  try {
+    return `data:image/jpeg;base64,${readFileSync(path).toString("base64")}`
+  } catch {
+    return null
+  }
+}
+
+async function clefRequest(
+  creds: { accountId: string; token: string },
+  model: string,
+  body: Record<string, unknown>,
+): Promise<any | null> {
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${creds.accountId}/ai/run/${model}`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${creds.token}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(45_000),
+      },
+    )
+    const json = await res.json()
+    return res.ok ? json : null
+  } catch {
+    return null
+  }
+}
+
+async function clefJudge(args: {
+  goal: string
+  report: any
+  dir: string
+}): Promise<{ pass: number; answers: QaAnswers } | null> {
+  const creds = clefCreds()
+  if (!creds) return null
+  const images = [`${args.dir}/preview-qa.jpg`, `${args.dir}/preview-qa-2.jpg`]
+    .map(jpegDataUri)
+    .filter((v): v is string => v !== null)
+  if (images.length === 0) return null
+  const compact = {
+    ...args.report,
+    objects: (args.report?.objects ?? []).slice(0, 40).map((o: any) => ({
+      name: o.name,
+      verts: o.verts,
+      faces: o.faces,
+      non_manifold_edges: o.non_manifold_edges,
+      islands: o.islands,
+      scale: o.scale,
+      transforms_applied: o.transforms_applied,
+      dims_m: o.dims_m,
+    })),
+  }
+  const state = [
+    `Goal of the 3D modeling job: ${args.goal}`,
+    `Deterministic scene checks (bmesh, ground truth): ${JSON.stringify(compact)}`,
+    `The images are QA renders of the saved scene: front 3/4 hero view first, opposite side second. They were rendered at reduced samples (16) on purpose, so mild Monte Carlo noise is expected and is not a defect.`,
+  ].join("\n")
+  const json = await clefRequest(creds, JUDGE_MODEL, {
+    model: JUDGE_MODEL.includes("/") ? JUDGE_MODEL.split("/").pop() : JUDGE_MODEL,
+    state,
+    questions: judgeQuestions(),
+    images,
+  })
+  const answers = json?.result?.answers
+  const pass = answers?.pass?.noul
+  if (typeof pass !== "number") return null
+  return { pass, answers }
+}
+
+// Route the goal to a shorter pipeline when it obviously does not need the
+// full studio treatment. Returns null when routing is unavailable; callers
+// fall back to the default roles.
+async function autoRoles(goal: string): Promise<Role[] | null> {
+  const creds = clefCreds()
+  if (!creds) return null
+  const json = await clefRequest(creds, ROUTE_MODEL, {
+    model: ROUTE_MODEL,
+    state: `Goal of a 3D modeling job: ${goal}`,
+    questions: {
+      kind: {
+        type: "choice",
+        instructions: "Which pipeline does this goal need?",
+        criteria: {
+          full: "A visual model (figurine, product, organic shape) that needs materials, studio lighting and visual QA",
+          printable: "A functional or printable part where materials and studio lighting do not matter; geometry QA only",
+          visual_fast: "A visual model where speed matters more than studio polish; skip the dedicated lighting stage",
+        },
+      },
+    },
+  })
+  const kind = json?.result?.answers?.kind?.choice
+  if (kind === "printable") return ["model", "qa"]
+  if (kind === "visual_fast") return ["model", "materials", "qa"]
+  if (kind === "full") return [...DEFAULT_ROLES]
+  return null
+}
+
+// ---------- direct MCP bridge commands (deterministic, no LLM) ----------
+
+function mcpCommand(command: object, timeoutMs = 90_000): Promise<any | null> {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (value: any) => {
+      if (settled) return
+      settled = true
+      try {
+        sock.destroy()
+      } catch {
+        void 0
+      }
+      resolve(value)
+    }
+    const sock = createConnection({ host: "127.0.0.1", port: blenderPort })
+    let buffer = ""
+    sock.setTimeout(timeoutMs)
+    sock.on("connect", () => sock.write(JSON.stringify(command)))
+    sock.on("data", (data) => {
+      buffer += data.toString()
+      try {
+        finish(JSON.parse(buffer))
+      } catch {
+        void 0
+      }
+    })
+    sock.on("timeout", () => finish(null))
+    sock.on("error", () => finish(null))
+  })
+}
+
+async function mcpSaveScene(blendPath: string): Promise<boolean> {
+  const response = await mcpCommand(
+    {
+      type: "execute_code",
+      params: {
+        code: `import bpy\nbpy.ops.wm.save_as_mainfile(filepath=${JSON.stringify(blendPath)})\nprint('SAVED')`,
+      },
+    },
+    30_000,
+  )
+  return response?.status === "success"
+}
+
+function qaChecksScriptPath(): string {
+  const local = `${import.meta.dir}/qa_checks.py`
+  if (existsSync(local)) return local
+  return "/usr/local/bin/ob-plugin-blender-qa_checks.py"
+}
+
+// Deterministic QA on a copy of the saved scene: bmesh report, two reduced-
+// sample JPEG previews, and the model export — one headless blender process.
+async function runQaChecks(args: {
+  dir: string
+  blendPath: string
+  outPath: string
+}): Promise<any | null> {
+  const copy = `${args.dir}/qa-copy.blend`
+  try {
+    copyFileSync(args.blendPath, copy)
+  } catch {
+    return null
+  }
+  const proc = Bun.spawn(
+    ["blender", "--background", copy, "-P", qaChecksScriptPath()],
+    {
+      env: {
+        ...process.env,
+        QC_DIR: args.dir,
+        QC_EXPORT: args.outPath,
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    },
+  )
+  const killer = setTimeout(() => proc.kill(), 240_000)
+  const stdout = await new Response(proc.stdout).text()
+  await proc.exited
+  clearTimeout(killer)
+  const line = stdout
+    .split("\n")
+    .find((l) => l.includes("QA_REPORT_JSON"))
+  if (!line) return null
+  try {
+    return JSON.parse(line.slice(line.indexOf("QA_REPORT_JSON") + 15).trim())
+  } catch {
+    return null
+  }
+}
+
+// ---------- worker sessions ----------
 
 const serverPort = process.env.OPENCODE_ATTACH_PORT ?? "4096"
 
@@ -257,6 +548,104 @@ async function runWorker(
   }
 }
 
+// ---------- stage execution ----------
+
+const STAGE_RETRIES = 1
+
+// A stage succeeded only if the worker emitted a RESULT line; anything else
+// (crash, timeout, transport error, missing RESULT) is a failure.
+function stageFailed(result: string): boolean {
+  return !/^RESULT:/i.test(result) || /^RESULT: FAIL/i.test(result)
+}
+
+async function runStage(
+  role: Role,
+  goal: string,
+  dir: string,
+  blendPath: string,
+  outPath: string,
+  context: string[],
+  resume: boolean,
+  timeout: number,
+  noSave = false,
+): Promise<string> {
+  const started = Date.now()
+  process.stdout.write(`[blender-team] ${role}: working...\n`)
+  let result = ""
+  let attempt = 0
+  while (attempt <= STAGE_RETRIES) {
+    attempt += 1
+    const stageResumed = resume || attempt > 1
+    try {
+      const run = await runWorker(
+        rolePrompt(role, goal, dir, blendPath, outPath, context, stageResumed, noSave),
+        timeout,
+      )
+      result = extractResult(run.output)
+      if (result === "") {
+        result = run.timedOut
+          ? "worker timed out"
+          : "worker finished without a RESULT line"
+      }
+    } catch (error) {
+      result = error instanceof Error ? error.message : "worker crashed"
+    }
+    if (!stageFailed(result)) break
+    if (attempt <= STAGE_RETRIES) {
+      console.log(
+        `[blender-team] ${role}: retry ${attempt}/${STAGE_RETRIES} after: ${result.slice(0, 150)}`,
+      )
+    }
+  }
+  const seconds = Math.round((Date.now() - started) / 1000)
+  const failed = stageFailed(result)
+  console.log(
+    `[blender-team] ${role}: ${failed ? "failed" : "ok"} (${Math.floor(seconds / 60)}m${seconds % 60}s) ${result.slice(0, 200)}`,
+  )
+  return result
+}
+
+// The cheap deterministic QA pass: snapshot the live scene, run bmesh checks
+// plus reduced-sample previews plus the export headless, then let the Clef
+// judge decide. Returns null when any leg is unavailable (caller escalates).
+export async function cheapQa(args: {
+  goal: string
+  dir: string
+  blendPath: string
+  outPath: string
+}): Promise<{ result: string; passProbability?: number } | null> {
+  if (!(await mcpSaveScene(args.blendPath))) return null
+  const report = await runQaChecks(args)
+  if (!report) return null
+  const verdict = await clefJudge({ goal: args.goal, report, dir: args.dir })
+  if (!verdict) return null
+  const decision = qaDecision(verdict.pass, report)
+  const p = verdict.pass.toFixed(2)
+  if (decision === "pass") {
+    return {
+      result: `RESULT: PASS (judge p=${p}; geometry=${verdict.answers.geometry?.choice ?? "n/a"}, materials=${verdict.answers.materials?.choice ?? "n/a"}, severity=${verdict.answers.severity?.score?.toFixed(2) ?? "n/a"})`,
+      passProbability: verdict.pass,
+    }
+  }
+  if (decision === "fail") {
+    const defects = [
+      verdict.answers.geometry?.choice,
+      verdict.answers.materials?.choice,
+      verdict.answers.severity?.score !== undefined
+        ? `severity ${verdict.answers.severity.score.toFixed(2)}`
+        : null,
+    ]
+      .filter((v) => v && v !== "none" && !v?.startsWith("severity"))
+      .join(", ")
+    const severity = verdict.answers.severity?.score
+    return {
+      result: `RESULT: FAIL: judge p=${p} (${defects || "low confidence"}${severity !== undefined ? `, severity ${severity.toFixed(2)}` : ""})${report?.total_non_manifold_edges > 0 ? `; bmesh: ${report.total_non_manifold_edges} non-manifold edges` : ""}${report?.transforms_all_applied === false ? "; bmesh: transforms not applied" : ""}`,
+      passProbability: verdict.pass,
+    }
+  }
+  return null
+}
+
 async function main() {
   const args = process.argv.slice(2)
   let goal = ""
@@ -265,6 +654,8 @@ async function main() {
   let timeout = 30
   let out = ""
   let resume = false
+  let autoRoute = false
+  let serial = false
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
     if (arg === "--roles") rolesRaw = args[++i] ?? ""
@@ -273,16 +664,18 @@ async function main() {
       timeout = Number.parseInt(args[++i] ?? "30", 10)
     } else if (arg === "--out") out = args[++i] ?? ""
     else if (arg === "--resume") resume = true
+    else if (arg === "--auto-roles") autoRoute = true
+    else if (arg === "--serial") serial = true
     else if (arg === "-h" || arg === "--help") usage()
     else if (goal === "") goal = arg
   }
   if (goal.trim() === "") usage()
-  const roles = rolesRaw ? parseRoles(rolesRaw) : DEFAULT_ROLES
-  if (!roles) {
-    fail(
-      `unknown role in --roles '${rolesRaw}' (known: model, materials, lighting, qa)`,
-    )
+  let roles = rolesRaw ? parseRoles(rolesRaw) : null
+  if (!roles && autoRoute) {
+    roles = await autoRoles(goal)
+    if (roles) console.log(`[blender-team] auto-roles: ${roles.join(" -> ")}`)
   }
+  if (!roles) roles = DEFAULT_ROLES
   if (!Number.isFinite(timeout) || timeout <= 0) timeout = 15
   if (!Number.isFinite(rounds) || rounds < 0) rounds = 0
 
@@ -321,62 +714,153 @@ async function main() {
   console.log(`[blender-team] roles: ${roles.join(" -> ")}`)
   console.log(`[blender-team] work dir: ${dir}`)
   const context: string[] = []
-  const STAGE_RETRIES = 1
+  const judge = qaJudgeEnabled() && clefCreds() !== null
+  const parallel = !serial && parallelStagesEnabled()
   try {
-    for (const role of roles) {
-      const started = Date.now()
-      process.stdout.write(`[blender-team] ${role}: working...\n`)
-      let result = ""
-      let attempt = 0
-      while (attempt <= STAGE_RETRIES) {
-        attempt += 1
-        const stageResumed = resume || attempt > 1
-        try {
-          const run = await runWorker(
-            rolePrompt(
-              role,
-              goal,
-              dir,
-              blendPath,
-              outPath,
-              context,
-              stageResumed,
-            ),
-            timeout,
-          )
-          result = extractResult(run.output)
-          if (result === "") {
-            result = run.timedOut
-              ? "worker timed out"
-              : "worker finished without a RESULT line"
+    let i = 0
+    while (i < roles.length) {
+      const role = roles[i]
+      // materials and lighting touch disjoint parts of the scene and both
+      // depend only on geometry, so they run concurrently when allowed.
+      const pair =
+        parallel &&
+        role === "materials" &&
+        roles[i + 1] === "lighting"
+      if (pair) {
+        const started = Date.now()
+        console.log("[blender-team] materials+lighting: working in parallel...")
+        const prompts = (["materials", "lighting"] as Role[]).map((r) =>
+          rolePrompt(r, goal, dir, blendPath, outPath, context, resume, true),
+        )
+        const runs = await Promise.allSettled(
+          prompts.map((prompt) => runWorker(prompt, timeout)),
+        )
+        const results = await Promise.all(
+          runs.map(async (r, idx) => {
+            if (r.status !== "fulfilled") {
+              return "worker crashed"
+            }
+            const extracted = extractResult(r.value.output)
+            return extracted === ""
+              ? r.value.timedOut
+                ? "worker timed out"
+                : "worker finished without a RESULT line"
+              : extracted
+          }),
+        )
+        for (let idx = 0; idx < 2; idx++) {
+          const r: Role = idx === 0 ? "materials" : "lighting"
+          let result = results[idx]
+          let logged = false
+          if (stageFailed(result)) {
+            ok = false
+            console.log(
+              `[blender-team] ${r}: parallel attempt failed; retrying sequentially`,
+            )
+            result = await runStage(
+              r, goal, dir, blendPath, outPath, context, resume, timeout,
+            )
+            logged = true
           }
-        } catch (error) {
-          result = error instanceof Error ? error.message : "worker crashed"
+          const seconds = Math.round((Date.now() - started) / 1000)
+          const failed = stageFailed(result)
+          if (!logged) {
+            console.log(
+              `[blender-team] ${r}: ${failed ? "failed" : "ok"} (${Math.floor(seconds / 60)}m${seconds % 60}s) ${result.slice(0, 200)}`,
+            )
+          }
+          context.push(`${r}: ${result}`)
+          if (failed) {
+            fail(`[blender-team] stage ${r} failed: ${result}`)
+          }
         }
-        if (!/^(worker|RESULT: FAIL)/i.test(result)) break
-        if (attempt <= STAGE_RETRIES) {
+        if (!(await mcpSaveScene(blendPath))) {
           console.log(
-            `[blender-team] ${role}: retry ${attempt}/${STAGE_RETRIES} after: ${result.slice(0, 150)}`,
+            "[blender-team] note: could not snapshot the scene after the parallel stages; the qa worker saves it instead",
           )
+        }
+        i += 2
+        continue
+      }
+
+      if (role !== "qa") {
+        const result = await runStage(
+          role, goal, dir, blendPath, outPath, context, resume, timeout,
+        )
+        context.push(`${role}: ${result}`)
+        if (stageFailed(result)) {
+          fail(`[blender-team] stage ${role} failed: ${result}`)
+        }
+        i += 1
+        continue
+      }
+
+      // QA: cheap deterministic pass (bmesh + Clef judge) first, legacy LLM
+      // qa worker as escalation and as fallback when the judge is off.
+      let result: string | null = null
+      if (judge) {
+        const started = Date.now()
+        const cheap = await cheapQa({ goal, dir, blendPath, outPath })
+        if (cheap !== null) {
+          const seconds = Math.round((Date.now() - started) / 1000)
+          console.log(
+            `[blender-team] qa(auto): ${cheap.result.startsWith("RESULT: PASS") ? "ok" : "failed"} (${Math.floor(seconds / 60)}m${seconds % 60}s) ${cheap.result.slice(0, 200)}`,
+          )
+          if (cheap.result.startsWith("RESULT: PASS")) {
+            result = cheap.result
+          } else {
+            // confident FAIL: fix rounds re-verified by the cheap pass
+            let fixed = false
+            for (let round = 1; round <= rounds; round++) {
+              console.log(`[blender-team] fix round ${round}/${rounds}`)
+              const fixStarted = Date.now()
+              const fixRun = await runWorker(
+                rolePrompt("fix", goal, dir, blendPath, outPath, context),
+                timeout,
+              ).catch((error) => ({
+                output: error instanceof Error ? error.message : "worker crashed",
+                timedOut: false,
+              }))
+              const fixResult = extractResult(fixRun.output) || "no RESULT line"
+              const secondsFix = Math.round((Date.now() - fixStarted) / 1000)
+              const recheck = await cheapQa({ goal, dir, blendPath, outPath })
+              const recheckPass = recheck?.result.startsWith("RESULT: PASS") ?? false
+              console.log(
+                `[blender-team] fix: ${recheckPass ? "ok" : "failed"} (${Math.floor(secondsFix / 60)}m${secondsFix % 60}s) ${fixResult.slice(0, 200)}`,
+              )
+              context.push(`fix round ${round}: ${fixResult}`)
+              if (recheckPass && recheck) {
+                result = recheck.result
+                fixed = true
+                break
+              }
+            }
+            if (!fixed) {
+              fail(
+                `[blender-team] QA still failing after fix rounds; scene saved in ${blendPath}`,
+              )
+            }
+          }
         }
       }
-      const seconds = Math.round((Date.now() - started) / 1000)
-      const failed = /^(worker|RESULT: FAIL)/i.test(result)
-      console.log(
-        `[blender-team] ${role}: ${failed ? "failed" : "ok"} (${Math.floor(seconds / 60)}m${seconds % 60}s) ${result.slice(0, 200)}`,
-      )
-      context.push(`${role}: ${result}`)
-      if ((role === "qa" || role === "fix") && /^RESULT: FAIL/i.test(result)) {
+      if (result === null) {
+        // escalation or judge-off: the legacy LLM qa worker owns this stage
+        result = await runStage(
+          "qa", goal, dir, blendPath, outPath, context, resume, timeout,
+        )
+      }
+      context.push(`qa: ${result}`)
+      if (/^RESULT: FAIL/i.test(result)) {
         let fixed = false
         for (let round = 1; round <= rounds; round++) {
           console.log(`[blender-team] fix round ${round}/${rounds}`)
-          const startedFix = Date.now()
+          const fixStarted = Date.now()
           const run = await runWorker(
             rolePrompt("fix", goal, dir, blendPath, outPath, context),
             timeout,
           )
           const fixResult = extractResult(run.output) || "no RESULT line"
-          const secondsFix = Math.round((Date.now() - startedFix) / 1000)
+          const secondsFix = Math.round((Date.now() - fixStarted) / 1000)
           console.log(
             `[blender-team] fix: ${/^RESULT: PASS/i.test(fixResult) ? "ok" : "failed"} (${Math.floor(secondsFix / 60)}m${secondsFix % 60}s) ${fixResult.slice(0, 200)}`,
           )
@@ -391,23 +875,21 @@ async function main() {
             `[blender-team] QA still failing after fix rounds; scene saved in ${blendPath}`,
           )
         }
-      } else if (failed) {
-        console.log("[blender-team] aborting: a stage failed")
-        fail(`[blender-team] stage ${role} failed: ${result}`)
+      } else if (!/^RESULT: PASS/i.test(result)) {
+        fail(`[blender-team] stage qa failed: ${result}`)
       }
-      if (role === "qa" || role === "fix") {
-        if (existsSync(outPath)) {
-          console.log(`[blender-team] exported ${outPath}`)
-        } else {
-          console.log(
-            `[blender-team] note: no export at ${outPath}; the qa worker did not export`,
-          )
-        }
+      if (existsSync(outPath)) {
+        console.log(`[blender-team] exported ${outPath}`)
+      } else {
+        console.log(
+          `[blender-team] note: no export at ${outPath}; the qa worker did not export`,
+        )
       }
+      i += 1
     }
     console.log(`[blender-team] done. scene: ${blendPath}`)
     if (existsSync(outPath)) console.log(`[blender-team] model: ${outPath}`)
-    console.log(`[blender-team] previews: ${dir}/preview-*.png`)
+    console.log(`[blender-team] previews: ${dir}/preview-*.jpg ${dir}/preview-*.png`)
   } finally {
     releaseLock()
   }

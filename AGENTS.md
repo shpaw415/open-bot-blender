@@ -10,9 +10,13 @@ desktops. Lives at the custom domain marketplace; publish base URL is
 - `open-bot.plugin.json` — the manifest (files, setup, skill, opencode mcp +
   blender-worker agent + build-agent `blender_*` deny, configs)
 - `files/` — payload files shipped in the release tarball: `blender-team`
-  (bun CLI), `blender-up.sh` (service supervisor, honors the plugin
-  `enabled` setting), `blender-serve.py` + `addon.py` (vendored blender-mcp)
-- `test/` — bun tests (manifest contract + CLI behavior + toggle read)
+  (bun CLI: parallel materials+lighting, cheap QA via `qa_checks.py` +
+  Clef judge with escalation to the LLM qa worker, `--auto-roles`,
+  `--serial`), `blender-up.sh` (service supervisor, honors the plugin
+  `enabled` setting), `blender-serve.py` + `addon.py` (vendored blender-mcp),
+  `qa_checks.py` (headless bmesh report + previews + export on a scene copy)
+- `test/` — bun tests (manifest contract + CLI behavior + toggle read +
+  judge thresholds + creds resolution)
 
 ## Workflow
 

@@ -1,8 +1,8 @@
 {
   "id": "blender",
   "name": "Blender 3D",
-  "version": "1.0.2",
-  "description": "Headless Blender 3D modeling on this desktop: a blender-team worker pipeline (model, materials, lighting, qa) drives a live Blender through the blender MCP tools and exports .glb/.stl models with rendered previews into the workspace.",
+  "version": "beta-1",
+  "description": "Headless Blender 3D modeling on this desktop: a blender-team worker pipeline (model, materials+lighting in parallel, qa) drives a live Blender through the blender MCP tools; QA is a deterministic bmesh pass judged by the Clef decision model (escalating to an LLM qa worker when unsure), exporting .glb/.stl with rendered previews into the workspace.",
   "author": "shpaw415",
   "repo": "shpaw415/open-bot-blender",
   "category": "3d",
@@ -37,13 +37,18 @@
       "name": "addon.py",
       "source": "files/addon.py",
       "exec": false
+    },
+    {
+      "name": "qa_checks.py",
+      "source": "files/qa_checks.py",
+      "exec": false
     }
   ],
   "skills": [
     {
       "name": "blender",
       "description": "Local 3D modeling with Blender on this desktop. Use when the user asks for a real 3D model, a product visual, a printable part, materials or lighting beyond procedural gpio-3d parts, or any Blender scene work. Covers the blender-team worker pipeline (the only path that has the blender MCP tools) and quick headless bpy one-offs.",
-      "body": "# Blender on this desktop\n\nA headless Blender runs on 127.0.0.1:9876 with the blender-mcp addon socket\nserver. You (the chat agent) do NOT have the blender MCP tools \u2014 only\n`blender-team` workers do. Never launch a second Blender instance and never\nopen the scene file in another instance: the live scene exists only in the\nrunning process.\n\n## Team pipeline (default path)\n\n```sh\nblender-team \"a ceramic owl figurine, 80mm tall, printable\" -o /home/agent/workspace/owl.glb\n```\n\n- The orchestrator runs role workers in order: `model` \u2192 `materials` \u2192\n  `lighting` \u2192 `qa`, each an opencode session driving the live scene through\n  the blender MCP tools (`get_scene_info`, `execute_code`, \u2026). QA renders a\n  preview and exports the model; on `RESULT: FAIL` it spawns fix rounds\n  (`--rounds`, default 1).\n- `--roles model,materials,qa` picks a shorter pipeline. `--timeout 40` sets\n  the per-worker minute budget (default 30 \u2014 raise it for hard organic\n  models). `--out path.glb` (or `.stl`) sets the export target.\n- `--resume` continues on the live scene from an earlier pipeline (after a\n  failed or timed-out run) instead of assuming a factory-startup scene;\n  pair it with `--roles` to rerun only the stages that are still missing.\n  A retried stage is told the scene may hold partial work, so a timeout\n  costs progress only when the work was unusable.\n- Each worker saves the scene to a `blender-team-<ts>/scene.blend` under the\n  workspace and renders `preview-<role>.png` there. Read those PNGs to review\n  a stage.\n- The CLI prints one `[blender-team]` line per stage. Surface the final model\n  path and previews; do not paste the log.\n- A scene lock serializes runs. If it says another run holds the lock, wait.\n  Do not drive Blender yourself while a team runs.\n\n## Quick headless one-offs (no MCP needed)\n\nFor a small deterministic edit (unit conversion, export, mesh stats), skip\nthe team and run bpy directly:\n\n```sh\nblender --background /home/agent/workspace/model.glb --python-expr \"import bpy; print(len(bpy.data.objects))\"\nblender --background --python /tmp/script.py\n```\n\nPrefer `blender-team` when the goal needs modeling judgment, materials,\nlighting, or iteration.\n\n## Deliverables\n\n- Save exports and previews under `/home/agent/workspace`.\n- Embed the final model: `![description](/home/agent/workspace/name.glb)` \u2014\n  the chat renders an interactive 3D viewer for `.glb`/`.gltf`. Embed\n  `preview-qa.png` as an image when it shows the result well.\n- For AI-generated meshes from a provider (Meshy, Tripo, \u2026) use `gen-3d`\n  instead; Blender is for local, controllable, printable work.\n\n## Service toggle\n\nThe plugin's `enabled` setting controls the Blender service: set it to `off`\non the dashboard (Plugins page -> blender -> settings) and the supervisor\nstops Blender within seconds; set it back to `on` (or anything else) and it\nrestarts.\n\n## Troubleshooting\n\n- `Blender is not reachable on 127.0.0.1:9876` \u2014 check\n  `~/.open-bot/blender.log`; the supervisor restarts crashed instances in a\n  few seconds, so retry once after a pause.\n- `the blender plugin service is set to off` \u2014 turn it back on in the\n  dashboard (Plugins page -> blender -> settings) and tell the user.\n- `another blender-team run holds the scene lock` \u2014 wait, or remove\n  `~/.open-bot/blender-team.lock` only if no run is actually going.\n"
+      "body": "# Blender on this desktop\n\nA headless Blender runs on 127.0.0.1:9876 with the blender-mcp addon socket\nserver. You (the chat agent) do NOT have the blender MCP tools — only\n`blender-team` workers do. Never launch a second Blender instance and never\nopen the scene file in another instance: the live scene exists only in the\nrunning process.\n\n## Team pipeline (default path)\n\n```sh\nblender-team \"a ceramic owl figurine, 80mm tall, printable\" -o /home/agent/workspace/owl.glb\n```\n\n- The orchestrator runs role workers in order: `model` → `materials` →\n  `lighting` → `qa`. Materials and lighting run in PARALLEL by default (they\ntouch disjoint parts of the scene); `--serial` forces the old sequential\n  order. Each worker is an opencode session driving the live scene through\n  the blender MCP tools (`get_scene_info`, `execute_code`, …).\n- QA is cheap and deterministic first: the orchestrator snapshots the scene,\n  runs a headless bmesh report plus two 16-sample JPEG previews plus the\n  export in one `blender --background` process (`qa_checks.py`), and the\n  Clef decision model (Cloudflare Workers AI) judges the renders against the\n  goal. Judge pass p >= 0.7 passes; p < 0.3 fails into fix rounds; the band\n  between escalates to the legacy LLM `qa` worker. Fix rounds are re-checked\n  by the same cheap pass (~10 s), not by another LLM session. The dashboard\n  config `qa_judge` (on/off) turns the judge off (config key in\n  Plugins → blender → settings); without Cloudflare credentials the judge is\n  skipped and the legacy qa worker runs.\n- `--auto-roles` routes the goal with clef-flash first (printable part →\n  model+qa only; fast visual → no lighting stage). Off by default.\n- `--timeout 40` sets the per-worker minute budget (default 30 — raise it\n  for hard organic models). `--out path.glb` (or `.stl`) sets the export\n  target. `--roles model,materials,qa` picks a shorter pipeline manually.\n- `--resume` continues on the live scene from an earlier pipeline (after a\n  failed or timed-out run) instead of assuming a factory-startup scene;\n  pair it with `--roles` to rerun only the stages that are still missing.\n  A retried stage is told the scene may hold partial work, so a timeout\n  costs progress only when the work was unusable.\n- Each worker saves the scene to a `blender-team-<ts>/scene.blend` under the\n  workspace and renders `preview-<role>.png` there; the qa stage writes\n  `preview-qa.jpg` / `preview-qa-2.jpg` at reduced samples. Read those to\n  review a stage.\n- The CLI prints one `[blender-team]` line per stage. Surface the final model\n  path and previews; do not paste the log.\n- A scene lock serializes runs. If it says another run holds the lock, wait.\n  Do not drive Blender yourself while a team runs.\n\n## Quick headless one-offs (no MCP needed)\n\nFor a small deterministic edit (unit conversion, export, mesh stats), skip\nthe team and run bpy directly:\n\n```sh\nblender --background /home/agent/workspace/model.glb --python-expr \"import bpy; print(len(bpy.data.objects))\"\nblender --background --python /tmp/script.py\n```\n\nPrefer `blender-team` when the goal needs modeling judgment, materials,\nlighting, or iteration.\n\n## Deliverables\n\n- Save exports and previews under `/home/agent/workspace`.\n- Embed the final model: `![description](/home/agent/workspace/name.glb)` \u2014\n  the chat renders an interactive 3D viewer for `.glb`/`.gltf`. Embed\n  `preview-qa.png` as an image when it shows the result well.\n- For AI-generated meshes from a provider (Meshy, Tripo, \u2026) use `gen-3d`\n  instead; Blender is for local, controllable, printable work.\n\n## Service toggle\n\nThe plugin's `enabled` setting controls the Blender service: set it to `off`\non the dashboard (Plugins page -> blender -> settings) and the supervisor\nstops Blender within seconds; set it back to `on` (or anything else) and it\nrestarts.\n\n## Troubleshooting\n\n- `Blender is not reachable on 127.0.0.1:9876` \u2014 check\n  `~/.open-bot/blender.log`; the supervisor restarts crashed instances in a\n  few seconds, so retry once after a pause.\n- `the blender plugin service is set to off` \u2014 turn it back on in the\n  dashboard (Plugins page -> blender -> settings) and tell the user.\n- `another blender-team run holds the scene lock` \u2014 wait, or remove\n  `~/.open-bot/blender-team.lock` only if no run is actually going.\n"
     }
   ],
   "configs": [
@@ -51,11 +56,21 @@
       "key": "enabled",
       "label": "Blender service (on/off)",
       "def": "on"
+    },
+    {
+      "key": "qa_judge",
+      "label": "Clef QA judge (on/off)",
+      "def": "on"
+    },
+    {
+      "key": "parallel",
+      "label": "Parallel materials+lighting (on/off)",
+      "def": "on"
     }
   ],
   "setup": {
     "commands": [
-      "apt-get update -qq && apt-get install -y --no-install-recommends blender xauth",
+      "apt-get update -qq && apt-get install -y --no-install-recommends blender xauth python3-numpy",
       "grep -rl \"np\\.bool\\b\" /usr/share/blender/scripts/addons/io_scene_gltf2 2>/dev/null | xargs -r sed -i \"s/np\\.bool\\b/bool/g\"",
       "V=/home/agent/.open-bot/plugin-blender; test -x $V/venv/bin/blender-mcp || { python3 -m venv $V/venv && $V/venv/bin/pip install --no-cache-dir blender-mcp; }",
       "V=/home/agent/.open-bot/plugin-blender; test -d $V/requests || python3 -m pip install --no-cache-dir --no-binary=:all: --target $V/requests requests",
