@@ -50,6 +50,7 @@ while :; do
     if running; then
       pkill -f "blender --factory-startup" 2>/dev/null || true
       pkill -f blender-serve.py 2>/dev/null || true
+      pkill -f "xvfb-run -a blender" 2>/dev/null || true
       echo "$(date -u +%FT%TZ) blender stopped (plugin service off)" >>"$log"
     fi
   fi
