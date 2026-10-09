@@ -21,22 +21,21 @@ bun test                                        # always green before release
 # bump version in open-bot.plugin.json, then:
 git commit && git push
 gh release create v<version> -R shpaw415/open-bot-blender --notes "..."
-# publish (review is slow/flaky — expect 524s, retry):
-curl -s -m 290 -X POST https://market.open-bot.app/api/publish \
-  -H "Authorization: Bearer $(grep '^OP_API_KEY=' ../open-bot/.env | cut -d= -f2-)" \
-  -H "content-type: application/json" \
-  -d "$(jq -n --slurpfile m open-bot.plugin.json '{manifest: $m[0]}')"
+ob-plugin publish ~/plugins-create/blender      # on the open-bot desktop
 ```
 
-- Publish auth: marketplace user API key `OP_API_KEY` in the open-bot
-  project's root `.env` (or instance token `OPEN_BOT_MARKETPLACE_TOKEN` in
-  `../open-bot/deploy/.env`).
-- Each publish re-runs the GLM security review; only a `pass` stores the
-  release tarball in R2 and flips the version to `approved`.
+- On the desktop, `ob-plugin publish` talks to the control plane, which
+  holds the marketplace token; no key handling here. From a host, POST the
+  manifest to `https://market.open-bot.app/api/publish` with the marketplace
+  user API key (`OP_API_KEY` in the open-bot project's root `.env`) or the
+  instance token (`OPEN_BOT_MARKETPLACE_TOKEN` in `deploy/.env`).
+- Each publish re-runs the GLM security review; expect 524s and "no usable
+  verdict" errors — retry, it passes on a later attempt. Only a `pass`
+  stores the release tarball in R2 and flips the version to `approved`.
 - Install/upgrade on a desktop: `ob-plugin install blender --yes`.
 - The guard cron `plugin:blender:guard` (created 2026-10-09 on the live
-  instance) maintains this repo: issues, PRs, marketplace discussion,
-  releases. Plugin projects on desktops live in `~/plugins-create/blender`.
+  instance) maintains this repo from `~/plugins-create/blender`: issues,
+  PRs, marketplace discussion, releases.
 
 ## Platform notes
 
