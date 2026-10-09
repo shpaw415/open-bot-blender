@@ -1,0 +1,418 @@
+#!/usr/bin/env bun
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs"
+import { createConnection } from "node:net"
+
+const home = process.env.HOME ?? "/home/agent"
+const blenderPort = Number(process.env.BLENDER_MCP_PORT ?? "9876")
+const SOCKET_TIMEOUT_MS = 5_000
+const LOCK_DIR = `${home}/.open-bot/blender-team.lock`
+const LOCK_TIMEOUT_MS = 60_000
+
+type Role = "model" | "materials" | "lighting" | "qa" | "fix"
+
+export const DEFAULT_ROLES: Role[] = ["model", "materials", "lighting", "qa"]
+
+export function parseRoles(raw: string): Role[] | null {
+  const parts = raw
+    .split(",")
+    .map((part) => part.trim().toLowerCase())
+    .filter(Boolean)
+  if (parts.length === 0) return null
+  const roles: Role[] = []
+  for (const part of parts) {
+    if (
+      part !== "model" &&
+      part !== "materials" &&
+      part !== "lighting" &&
+      part !== "qa"
+    ) {
+      return null
+    }
+    if (!roles.includes(part as Role)) roles.push(part as Role)
+  }
+  return roles
+}
+
+export function extractResult(output: string): string {
+  const lines = output.split("\n").map((line) => line.trim())
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].toUpperCase().startsWith("RESULT:")) {
+      return lines[i].slice(7).trim()
+    }
+  }
+  return ""
+}
+
+let ownLock = false
+
+function fail(message: string): never {
+  console.error(message)
+  if (ownLock) releaseLock()
+  process.exit(1)
+}
+
+function usage(): never {
+  fail(
+    'usage: blender-team "goal" [--roles model,materials,lighting,qa] [--rounds 1] [--timeout 30] [--out /home/agent/workspace/model.glb] [--resume]',
+  )
+}
+
+async function blenderSocketUp(): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (ok: boolean) => {
+      if (settled) return
+      settled = true
+      resolve(ok)
+    }
+    const sock = createConnection({ host: "127.0.0.1", port: blenderPort })
+    sock.setTimeout(SOCKET_TIMEOUT_MS)
+    sock.on("connect", () => {
+      sock.destroy()
+      done(true)
+    })
+    sock.on("timeout", () => {
+      sock.destroy()
+      done(false)
+    })
+    sock.on("error", () => done(false))
+  })
+}
+
+// The blender plugin's service toggle lives in the plugin settings the
+// control plane syncs to ~/.config/open-bot/plugin-blender.json. Missing
+// file defaults to on; anything other than "off" is on.
+export function blenderServiceEnabled(): boolean {
+  try {
+    const config = JSON.parse(
+      readFileSync(`${home}/.config/open-bot/plugin-blender.json`, "utf8"),
+    ) as { settings?: { enabled?: string } }
+    return config.settings?.enabled !== "off"
+  } catch {
+    return true
+  }
+}
+
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === "EPERM"
+  }
+}
+
+async function acquireLock(): Promise<void> {
+  const deadline = Date.now() + LOCK_TIMEOUT_MS
+  let announcedStale = false
+  while (Date.now() < deadline) {
+    try {
+      mkdirSync(LOCK_DIR)
+      Bun.write(`${LOCK_DIR}/pid`, `${process.pid}\n`)
+      return
+    } catch {
+      if (lockHolderAlive() === false) {
+        if (!announcedStale) {
+          announcedStale = true
+          console.log("[blender-team] removing a stale lock from a dead run")
+        }
+        try {
+          rmSync(LOCK_DIR, { recursive: true, force: true })
+        } catch {
+          void 0
+        }
+        continue
+      }
+      await Bun.sleep(1000)
+    }
+  }
+  fail(
+    "another blender-team run holds the scene lock. Wait for it to finish, or remove ~/.open-bot/blender-team.lock if it is stale.",
+  )
+}
+
+function lockHolderAlive(): boolean {
+  try {
+    const raw = readFileSync(`${LOCK_DIR}/pid`, "utf8")
+    return isProcessAlive(Number.parseInt(raw.trim(), 10))
+  } catch {
+    return false
+  }
+}
+
+function releaseLock() {
+  try {
+    rmSync(LOCK_DIR, { recursive: true, force: true })
+  } catch {
+    void 0
+  }
+}
+
+export function rolePrompt(
+  role: Role,
+  goal: string,
+  dir: string,
+  blendPath: string,
+  outPath: string,
+  context: string[],
+  resumed = false,
+): string {
+  let sceneState: string
+  if (context.length > 0) {
+    sceneState = `What previous stages did:\n${context.map((line) => `- ${line}`).join("\n")}`
+  } else if (resumed) {
+    sceneState =
+      "This run continues an earlier pipeline: the live scene already contains work from a previous attempt. Inspect it first with get_scene_info and build on that state; only redo existing objects when they are unusable for the goal."
+  } else {
+    sceneState =
+      "The live scene starts from the factory startup file; you are first."
+  }
+  const shared = [
+    `You are the ${role} worker in a blender-team pipeline. The orchestrator assigned you one stage.`,
+    `Goal of the whole team: ${goal}`,
+    `A single Blender instance runs headless on 127.0.0.1:9876 with the team scene in memory. Drive it ONLY through the blender MCP tools (get_scene_info, get_object_info, execute_blender_code). Never launch another Blender process and never open the scene file in a second instance.`,
+    sceneState,
+  ].join("\n\n")
+  const save =
+    `When your stage is done, save the scene with execute_blender_code: bpy.ops.wm.save_as_mainfile(filepath="${blendPath}")` +
+    ` and render a preview to ${dir}/preview-${role}.png (engine CYCLES, 960x540, 32 samples, camera framed on the model; create the camera if missing).`
+  const tasks: Record<Role, string> = {
+    model:
+      "Build the geometry for the goal at real-world scale (1 Blender unit = 1 meter). Clean topology, clearly named objects. Do not add materials, lights, or cameras. If the goal names a printable part, keep walls printable and dimensions exact.",
+    materials:
+      "Assign physically plausible PBR materials to every object via execute_blender_code (Principled BSDF; measured-ish base colors/roughness). Do not change geometry or transforms. Do not touch lights or the camera.",
+    lighting:
+      "Set up lighting (sun + area or three-point rig) and frame a camera on the model. Set the scene render engine to CYCLES. Do not model or change materials.",
+    qa: `Inspect the scene: for every mesh object check scale/transforms are applied, count loose or non-manifold geometry (bmesh), and judge the model against the goal. Verify every countable or measurable requirement in the goal (object counts, dimensions, orientation, placement) by reading the scene, not by eyeballing a render. Fix small defects yourself; do not redesign. Then render at least two contrasting previews: the hero view to ${dir}/preview-qa.png plus a view from the opposite side or a close-up of the most detailed region to ${dir}/preview-qa-2.png, so a spec miss on one side cannot hide. If the goal asks for a printable part, verify watertightness. If everything is sound, export the model to ${outPath} with the matching bpy export operator (GLB via bpy.ops.export_scene.gltf, or STL via the STL export operator when the path ends in .stl) — create the output directory if needed.`,
+    fix: "The QA stage rejected the previous state. Fix exactly the defects listed below without redesigning what already passed. Re-run the same checks, re-render the preview, and save.",
+  }
+  return `${shared}\n\n${tasks[role]}\n\n${save}\n\nEnd your reply with exactly one line starting with "RESULT: " — for qa and fix it must start with "RESULT: PASS ..." or "RESULT: FAIL: <defects>".`
+}
+
+const serverPort = process.env.OPENCODE_ATTACH_PORT ?? "4096"
+
+function serverHeaders(): Record<string, string> {
+  const username = process.env.OPENCODE_SERVER_USERNAME || "opencode"
+  const password = process.env.OPENCODE_SERVER_PASSWORD ?? ""
+  return {
+    authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`,
+    "content-type": "application/json",
+  }
+}
+
+async function serverText(path: string, init?: RequestInit): Promise<any> {
+  const res = await fetch(`http://127.0.0.1:${serverPort}${path}`, {
+    ...init,
+    headers: { ...serverHeaders(), ...(init?.headers ?? {}) },
+  })
+  const text = await res.text()
+  if (!res.ok) {
+    throw new Error(
+      `opencode server ${path} failed (${res.status}): ${text.slice(0, 200)}`,
+    )
+  }
+  return text ? JSON.parse(text) : null
+}
+
+async function runWorker(
+  prompt: string,
+  timeoutMinutes: number,
+): Promise<{ output: string; timedOut: boolean }> {
+  const created = (await serverText("/session", {
+    method: "POST",
+    body: JSON.stringify({ title: `worker: blender-team ${Date.now()}` }),
+  })) as { id?: string }
+  const sessionId = created?.id
+  if (!sessionId) throw new Error("worker session could not be created")
+  const deadline = Date.now() + timeoutMinutes * 60_000
+  try {
+    await serverText(`/session/${sessionId}/prompt_async`, {
+      method: "POST",
+      body: JSON.stringify({
+        agent: "blender-worker",
+        parts: [{ type: "text", text: prompt }],
+      }),
+    })
+    while (Date.now() < deadline) {
+      await Bun.sleep(10_000)
+      const messages = (await serverText(
+        `/session/${sessionId}/message`,
+      )) as any[]
+      const last = messages?.[messages.length - 1]
+      const info = last?.info ?? {}
+      if (info.role === "assistant" && info.time?.completed != null) {
+        const output = (last.parts ?? [])
+          .filter((p: { type: string }) => p.type === "text")
+          .map((p: { text?: string }) => p.text ?? "")
+          .join("\n")
+        return { output, timedOut: false }
+      }
+    }
+    return { output: "", timedOut: true }
+  } finally {
+    await serverText(`/session/${sessionId}`, { method: "DELETE" }).catch(
+      () => undefined,
+    )
+  }
+}
+
+async function main() {
+  const args = process.argv.slice(2)
+  let goal = ""
+  let rolesRaw = ""
+  let rounds = 1
+  let timeout = 30
+  let out = ""
+  let resume = false
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === "--roles") rolesRaw = args[++i] ?? ""
+    else if (arg === "--rounds") rounds = Number.parseInt(args[++i] ?? "1", 10)
+    else if (arg === "--timeout") {
+      timeout = Number.parseInt(args[++i] ?? "30", 10)
+    } else if (arg === "--out") out = args[++i] ?? ""
+    else if (arg === "--resume") resume = true
+    else if (arg === "-h" || arg === "--help") usage()
+    else if (goal === "") goal = arg
+  }
+  if (goal.trim() === "") usage()
+  const roles = rolesRaw ? parseRoles(rolesRaw) : DEFAULT_ROLES
+  if (!roles) {
+    fail(
+      `unknown role in --roles '${rolesRaw}' (known: model, materials, lighting, qa)`,
+    )
+  }
+  if (!Number.isFinite(timeout) || timeout <= 0) timeout = 15
+  if (!Number.isFinite(rounds) || rounds < 0) rounds = 0
+
+  if (!Bun.which("blender")) {
+    fail("blender is not installed on this desktop")
+  }
+  if (!blenderServiceEnabled()) {
+    fail(
+      "the blender plugin service is set to off. Turn it on in the dashboard: Plugins page -> blender -> settings.",
+    )
+  }
+  if (!(await blenderSocketUp())) {
+    fail(
+      `Blender is not reachable on 127.0.0.1:${blenderPort}. Check ~/.open-bot/blender.log; if it was turned off, enable the blender plugin service in the dashboard: Plugins page -> blender -> settings.`,
+    )
+  }
+
+  const stamp = Date.now()
+  const dir = `${home}/workspace/blender-team-${stamp}`
+  mkdirSync(dir, { recursive: true })
+  const blendPath = `${dir}/scene.blend`
+  const outPath = out.trim() || `${home}/workspace/blender-team-${stamp}.glb`
+
+  await acquireLock()
+  ownLock = true
+  process.on("SIGINT", () => {
+    releaseLock()
+    process.exit(130)
+  })
+  process.on("SIGTERM", () => {
+    releaseLock()
+    process.exit(143)
+  })
+
+  console.log(`[blender-team] goal: ${goal}`)
+  console.log(`[blender-team] roles: ${roles.join(" -> ")}`)
+  console.log(`[blender-team] work dir: ${dir}`)
+  const context: string[] = []
+  const STAGE_RETRIES = 1
+  try {
+    for (const role of roles) {
+      const started = Date.now()
+      process.stdout.write(`[blender-team] ${role}: working...\n`)
+      let result = ""
+      let attempt = 0
+      while (attempt <= STAGE_RETRIES) {
+        attempt += 1
+        const stageResumed = resume || attempt > 1
+        try {
+          const run = await runWorker(
+            rolePrompt(
+              role,
+              goal,
+              dir,
+              blendPath,
+              outPath,
+              context,
+              stageResumed,
+            ),
+            timeout,
+          )
+          result = extractResult(run.output)
+          if (result === "") {
+            result = run.timedOut
+              ? "worker timed out"
+              : "worker finished without a RESULT line"
+          }
+        } catch (error) {
+          result = error instanceof Error ? error.message : "worker crashed"
+        }
+        if (!/^(worker|RESULT: FAIL)/i.test(result)) break
+        if (attempt <= STAGE_RETRIES) {
+          console.log(
+            `[blender-team] ${role}: retry ${attempt}/${STAGE_RETRIES} after: ${result.slice(0, 150)}`,
+          )
+        }
+      }
+      const seconds = Math.round((Date.now() - started) / 1000)
+      const failed = /^(worker|RESULT: FAIL)/i.test(result)
+      console.log(
+        `[blender-team] ${role}: ${failed ? "failed" : "ok"} (${Math.floor(seconds / 60)}m${seconds % 60}s) ${result.slice(0, 200)}`,
+      )
+      context.push(`${role}: ${result}`)
+      if ((role === "qa" || role === "fix") && /^RESULT: FAIL/i.test(result)) {
+        let fixed = false
+        for (let round = 1; round <= rounds; round++) {
+          console.log(`[blender-team] fix round ${round}/${rounds}`)
+          const startedFix = Date.now()
+          const run = await runWorker(
+            rolePrompt("fix", goal, dir, blendPath, outPath, context),
+            timeout,
+          )
+          const fixResult = extractResult(run.output) || "no RESULT line"
+          const secondsFix = Math.round((Date.now() - startedFix) / 1000)
+          console.log(
+            `[blender-team] fix: ${/^RESULT: PASS/i.test(fixResult) ? "ok" : "failed"} (${Math.floor(secondsFix / 60)}m${secondsFix % 60}s) ${fixResult.slice(0, 200)}`,
+          )
+          context.push(`fix round ${round}: ${fixResult}`)
+          if (/^RESULT: PASS/i.test(fixResult)) {
+            fixed = true
+            break
+          }
+        }
+        if (!fixed) {
+          fail(
+            `[blender-team] QA still failing after fix rounds; scene saved in ${blendPath}`,
+          )
+        }
+      } else if (failed) {
+        console.log("[blender-team] aborting: a stage failed")
+        fail(`[blender-team] stage ${role} failed: ${result}`)
+      }
+      if (role === "qa" || role === "fix") {
+        if (existsSync(outPath)) {
+          console.log(`[blender-team] exported ${outPath}`)
+        } else {
+          console.log(
+            `[blender-team] note: no export at ${outPath}; the qa worker did not export`,
+          )
+        }
+      }
+    }
+    console.log(`[blender-team] done. scene: ${blendPath}`)
+    if (existsSync(outPath)) console.log(`[blender-team] model: ${outPath}`)
+    console.log(`[blender-team] previews: ${dir}/preview-*.png`)
+  } finally {
+    releaseLock()
+  }
+}
+
+if (import.meta.main) {
+  await main()
+}
