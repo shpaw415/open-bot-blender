@@ -198,11 +198,12 @@ test("fails cleanly when blender is not installed", async () => {
   const home = join(`/tmp/opencode/blender-team-test-${Date.now()}`)
   mkdirSync(join(home, "bin"), { recursive: true })
   try {
-    const proc = Bun.spawn(["bun", script, "an owl"], {
+    // absolute bun + a PATH with only the stub dir, so the system blender
+    // (installed on real desktops) is never found
+    const proc = Bun.spawn([process.execPath, script, "an owl"], {
       env: {
-        ...process.env,
         HOME: home,
-        PATH: `${join(home, "bin")}:${process.env.PATH}`,
+        PATH: join(home, "bin"),
       },
       stdin: "ignore",
       stdout: "pipe",
